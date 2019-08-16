@@ -12,8 +12,10 @@ from logging import getLogger
 from collections import OrderedDict
 import numpy as np
 import torch
+from torch import autograd
 from torch.nn import functional as F
 from torch.nn.utils import clip_grad_norm_
+
 #from apex.fp16_utils import FP16_Optimizer
 
 from .utils import get_optimizer, to_cuda, concat_batches
@@ -86,7 +88,8 @@ class Trainer(object):
             [('PC-%s-%s' % (l1, l2), []) for l1, l2 in params.pc_steps] +
             [('AE-%s' % lang, []) for lang in params.ae_steps] +
             [('MT-%s-%s' % (l1, l2), []) for l1, l2 in params.mt_steps] +
-            [('BT-%s-%s-%s' % (l1, l2, l3), []) for l1, l2, l3 in params.bt_steps]
+            [('BT-%s-%s-%s' % (l1, l2, l3), []) for l1, l2, l3 in params.bt_steps] +
+            [('CTC-%s-%s' % (l1, l2), []) for l1, l2 in params.ctc_steps]
         )
         self.last_time = time.time()
 
@@ -618,6 +621,7 @@ class Trainer(object):
 
         # forward / loss
         tensor = model('fwd', x=x, lengths=lengths, langs=langs, causal=True)
+
         _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
         self.stats[('CLM-%s' % lang1) if lang2 is None else ('CLM-%s-%s' % (lang1, lang2))].append(loss.item())
         loss = lambda_coeff * loss
@@ -877,3 +881,62 @@ class EncDecTrainer(Trainer):
         self.n_sentences += params.batch_size
         self.stats['processed_s'] += len1.size(0)
         self.stats['processed_w'] += (len1 - 1).sum().item()
+
+
+class CTCTrainer(SingleTrainer):
+
+    def __init__(self, model, data, params):
+        assert params.encoder_only
+        assert params.ctc_model
+        super().__init__(model, data, params)
+
+    def ctc_step(self, lang1, lang2, lambda_coeff):
+        # MT with ctc loss
+
+        assert lambda_coeff >= 0
+        if lambda_coeff == 0:
+            return
+
+        params = self.params
+        self.model.train()
+
+        lang1_id = params.lang2id[lang1]
+        lang2_id = params.lang2id[lang2]
+
+        # todo think about auto-encoding in this setup
+        # generate batch
+        (x1, len1), (x2, len2) = self.get_batch('mt', lang1, lang2)
+        langs1 = x1.clone().fill_(lang1_id)
+        langs2 = x2.clone().fill_(lang2_id)
+
+        # target words to predict
+        alen = torch.arange(len2.max(), dtype=torch.long, device=len2.device)
+        pred_mask = alen[:, None] < len2[None] - 1  # do not predict anything given the last target word
+        y = x2[1:].masked_select(pred_mask[:-1])  # WHAT? .. i guess there is a start symbol in x2.
+        assert len(y) == (len2 - 1).sum().item()
+
+
+        # cuda
+        x1, len1, langs1, len2, langs2, y = to_cuda(x1, len1, langs1, len2, langs2, y)
+
+        # non-autoregressively translate source sentence
+        tensor = self.model("fwd", x=x1, lengths=len1, langs=langs1, causal=False)
+
+        # loss
+        _, loss = self.model("predict", tensor=tensor, pred_mask=None, y=y, get_scores=False, xlen=len1 * params.ctc_split_factor, ylen=len2 - 1)
+        self.stats[("CTC-%s-%s" % (lang1, lang2))].append(loss.item())
+        loss = lambda_coeff * loss
+
+        old_embeddings = self.model.embeddings.weight.cpu().detach().numpy()
+
+        # optimize
+        self.optimize(loss, "model")
+
+        # check NaN
+        if (self.model.embeddings.weight != self.model.embeddings.weight).data.any():
+            import ipdb;ipdb.set_trace()
+
+        # number of processed sentences / words
+        self.n_sentences += params.batch_size
+        self.stats['processed_s'] += len2.size(0)
+        self.stats['processed_w'] += (len2 - 1).sum().item()

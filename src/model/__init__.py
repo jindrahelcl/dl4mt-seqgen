@@ -91,6 +91,23 @@ def build_model(params, dico):
     """
     Build model.
     """
+    # if params.ctc_model:
+    #     # build
+    #     encoder = TransformerModel(params, dico, is_encoder=True, with_output=True)
+    #     split = StateSplit(params)
+
+    #     decoder = TransformerModel(params, dico, is_encoder=True, with_output=True)
+    #     # add cross attention!
+
+    #     logger.debug("Encoder: {}".format(encoder))
+    #     logger.debug("Splitter: {}".format(split))
+    #     logger.debug("Decoder: {}".format(decoder))
+    #     logger.info("Number of parameters (encoder): %i" % sum([p.numel() for p in encoder.parameters() if p.requires_grad]))
+    #     logger.info("Number of parameters (splitter): %i" % sum([p.numel() for p in split.parameters() if p.requires_grad]))
+    #     logger.info("Number of parameters (decoder): %i" % sum([p.numel() for p in decoder.parameters() if p.requires_grad]))
+
+    #     return encoder.cuda(), split.cuda(), decoder.cuda()
+
     if params.encoder_only:
         # build
         model = TransformerModel(params, dico, is_encoder=True, with_output=True)

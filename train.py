@@ -14,8 +14,8 @@ from src.slurm import init_signal_handler, init_distributed_mode
 from src.data.loader import check_data_params, load_data
 from src.utils import bool_flag, initialize_exp, set_sampling_probs, shuf_order
 from src.model import check_model_params, build_model
-from src.trainer import SingleTrainer, EncDecTrainer
-from src.evaluation.evaluator import SingleEvaluator, EncDecEvaluator
+from src.trainer import SingleTrainer, EncDecTrainer, CTCTrainer
+from src.evaluation.evaluator import SingleEvaluator, EncDecEvaluator, CTCEvaluator
 
 #import apex
 from src.fp16 import network_to_half
@@ -98,6 +98,14 @@ def get_parser():
     parser.add_argument("--word_blank", type=float, default=0,
                         help="Randomly blank input words (0 to disable)")
 
+    # ctc model parameters
+    parser.add_argument("--ctc_model", type=bool, default=False)
+    parser.add_argument("--ctc_split_factor", type=int, default=3)
+    parser.add_argument("--ctc_split_after_layer", type=int, default=5, help="0-based index of layer")
+    parser.add_argument("--ctc_use_inner_attention", type=bool, default=True)
+    parser.add_argument("--ctc_add_pos_emb_after_split", type=bool, default=True)
+
+
     # data
     parser.add_argument("--data_path", type=str, default="",
                         help="Data path")
@@ -159,8 +167,12 @@ def get_parser():
                         help="MT coefficient")
     parser.add_argument("--lambda_bt", type=str, default="1",
                         help="BT coefficient")
+    parser.add_argument("--lambda_ctc", type=str, default="1",
+                        help="CTC coefficient")
+
 
     # training steps
+    parser.add_argument("--ctc_steps", type=str, default="")
     parser.add_argument("--clm_steps", type=str, default="",
                         help="Causal prediction steps (CLM)")
     parser.add_argument("--mlm_steps", type=str, default="",
@@ -266,8 +278,12 @@ def main(params):
 
     # build trainer, reload potential checkpoints / build evaluator
     if params.encoder_only:
-        trainer = SingleTrainer(model, data, params)
-        evaluator = SingleEvaluator(trainer, data, params)
+        if params.ctc_model:
+            trainer = CTCTrainer(model, data, params)
+            evaluator = CTCEvaluator(trainer, data, params)
+        else:
+            trainer = SingleTrainer(model, data, params)
+            evaluator = SingleEvaluator(trainer, data, params)
     else:
         trainer = EncDecTrainer(encoder, decoder, data, params)
         evaluator = EncDecEvaluator(trainer, data, params)
@@ -307,6 +323,10 @@ def main(params):
             # denoising auto-encoder steps
             for lang in shuf_order(params.ae_steps):
                 trainer.mt_step(lang, lang, params.lambda_ae)
+
+            # CTC translation steps
+            for lang1, lang2 in shuf_order(params.ctc_steps):
+                trainer.ctc_step(lang1, lang2, params.lambda_ctc)
 
             # machine translation steps
             if not params.encoder_only:

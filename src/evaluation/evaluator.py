@@ -189,6 +189,12 @@ class Evaluator(object):
                     else:
                         self.evaluate_mt(scores, data_set, lang1, lang2, eval_bleu)
 
+                # CTC task (evaluate perplexity and accuracy)
+                for lang1, lang2 in set(params.ctc_steps):
+                    eval_bleu = params.eval_bleu and params.is_master
+                    scores['%s_%s-%s_mt_bleu' % (data_set, lang1, lang2)] = 0.0
+                    self.evaluate_ctc(scores, data_set, lang1, lang2, eval_bleu)
+
 
                 # report average metrics per language
                 _clm_mono = [l1 for (l1, l2) in params.clm_steps if l2 is None]
@@ -462,6 +468,96 @@ class SingleEvaluator(Evaluator):
         """
         super().__init__(trainer, data, params)
         self.model = trainer.model
+
+
+class CTCEvaluator(SingleEvaluator):
+
+    def __init__(self, trainer, data, params):
+        super().__init__(trainer, data, params)
+
+    def evaluate_ctc(self, scores, data_set, lang1, lang2, eval_bleu):
+
+
+        params = self.params
+        assert params.encoder_only
+
+        model = self.model
+        model.eval()
+        model = model.module if params.multi_gpu else model
+
+        lang1_id = params.lang2id[lang1]
+        lang2_id = params.lang2id[lang2]
+
+        n_words = 0
+        xe_loss = 0
+        n_valid = 0
+
+        # store hypothesis to compute BLEU score
+        if eval_bleu:
+            hypothesis = []
+
+        for batch in self.get_iterator(data_set, lang1, lang2):
+            # generate batch
+            (x1, len1), (x2, len2) = batch
+            langs1 = x1.clone().fill_(lang1_id)
+            langs2 = x2.clone().fill_(lang2_id)
+
+            # target words to predict
+            alen = torch.arange(len2.max(), dtype=torch.long, device=len2.device)
+            pred_mask = alen[:, None] < len2[None] - 1  # do not predict anything given the last target word
+            y = x2[1:].masked_select(pred_mask[:-1])  # WHAT? .. i guess there is a start symbol in x2.
+            assert len(y) == (len2 - 1).sum().item()
+
+            # cuda
+            x1, len1, langs1, len2, langs2, y = to_cuda(x1, len1, langs1, len2, langs2, y)
+
+            # non-autoregressively translate source sentence
+            tensor = self.model("fwd", x=x1, lengths=len1, langs=langs1, causal=False)
+
+            # loss
+            word_scores, loss = self.model("predict", tensor=tensor, pred_mask=None, y=y, get_scores=True, xlen=len1 * params.ctc_split_factor, ylen=len2 - 1)
+
+            # update stats
+            n_words += y.size(0)
+            xe_loss += loss.item() * len(y)
+            # n_valid += (word_scores.max(1)[1] == y).sum().item()
+
+            # generate translation - translate / convert to text
+            if eval_bleu:
+                max_len = int(1.5 * len1.max().item() + 10)
+                if params.beam_size == 1:
+                    generated, lengths = model.ctc_greedy_decode(word_scores, len1, lang2_id)
+                else:
+                    generated, lengths = model.generate_beam(
+                        tensor, len1, lang2_id, beam_size=params.beam_size,
+                        length_penalty=params.length_penalty,
+                        early_stopping=params.early_stopping,
+                        max_len=max_len
+                    )
+                hypothesis.extend(convert_to_text(generated, lengths, self.dico, params))
+
+
+            # compute perplexity #(and prediction accuracy)
+            scores['%s_%s-%s_mt_ppl' % (data_set, lang1, lang2)] = np.exp(xe_loss / n_words)
+            # scores['%s_%s-%s_mt_acc' % (data_set, lang1, lang2)] = 100. * n_valid / n_words
+
+            # compute BLEU
+            if eval_bleu:
+
+                # hypothesis / reference paths
+                hyp_name = 'hyp{0}.{1}-{2}.{3}.txt'.format(scores['epoch'], lang1, lang2, data_set)
+                hyp_path = os.path.join(params.hyp_path, hyp_name)
+                ref_path = params.ref_paths[(lang1, lang2, data_set)]
+
+                # export sentences to hypothesis file / restore BPE segmentation
+                with open(hyp_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(hypothesis) + '\n')
+                restore_segmentation(hyp_path)
+
+                # evaluate BLEU score
+                bleu = eval_moses_bleu(ref_path, hyp_path)
+                logger.info("BLEU %s %s : %f" % (hyp_path, ref_path, bleu))
+                scores['%s_%s-%s_mt_bleu' % (data_set, lang1, lang2)] = bleu
 
 
 class EncDecEvaluator(Evaluator):

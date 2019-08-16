@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.data.dictionary import BLANK_WORD
 
 N_MAX_POSITIONS = 512  # maximum input sequence length
 
@@ -37,7 +38,6 @@ TRANSFORMER_LAYER_PARAMS = [
 
 
 logger = getLogger()
-
 
 def Embedding(num_embeddings, embedding_dim, padding_idx=None):
     m = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
@@ -97,6 +97,57 @@ def get_masks(slen, lengths, causal):
     assert causal is False or attn_mask.size() == (bs, slen, slen)
 
     return mask, attn_mask
+
+
+class StateSplit(nn.Module):
+
+    def __init__(self, params):
+        super().__init__()
+
+        self.factor = params.ctc_split_factor
+        self.emb_dim = params.emb_dim
+
+        self.proj = Linear(self.emb_dim, self.emb_dim * self.factor, bias=True)
+
+    def forward(self, x, lengths):
+
+        x = self.proj(x)
+        x = self.split_by_factor(x)
+
+        return x, lengths * self.factor
+
+    def split_by_factor(self, x):
+        bs, slen, dim = x.size()
+        x = x.reshape(bs, slen * self.factor, dim // self.factor)
+        return x
+
+
+class CTCPredLayer(nn.Module):
+    def __init__(self, params):
+        super().__init__()
+        assert not params.asm
+
+        self.n_words = params.n_words
+        self.pad_index = params.pad_index
+
+        self.proj = Linear(params.emb_dim, params.n_words, bias=True)
+        self.softmax = nn.LogSoftmax(dim=-1)
+
+    def forward(self, x, y, xlen, ylen, get_scores=False):
+        assert (y == self.pad_index).sum().item() == 0
+
+        scores = self.proj(x)  #.view(-1, self.n_words)
+        log_probs = self.softmax(scores)
+
+        loss = F.ctc_loss(log_probs, y, xlen, ylen, zero_infinity=True, blank=BLANK_WORD)
+
+        # return tuple scores, loss; scores je vystup z projekce, loss je skalar
+        return log_probs, loss
+
+    def get_scores(self, x):
+        assert x.dim() == 2
+        return self.proj(x)
+
 
 
 class PredLayer(nn.Module):
@@ -279,6 +330,17 @@ class TransformerModel(nn.Module):
         self.attention_dropout = params.attention_dropout
         assert self.dim % self.n_heads == 0, 'transformer dim must be a multiple of n_heads'
 
+        # ctc parameters
+        self.ctc_model = params.ctc_model
+        self.ctc_split_factor = params.ctc_split_factor
+        self.ctc_split_after_layer = params.ctc_split_after_layer
+        self.ctc_use_inner_attention = params.ctc_use_inner_attention
+        self.ctc_add_pos_emb_after_split = params.ctc_add_pos_emb_after_split
+
+        if self.ctc_model:
+            assert 0 <= self.ctc_split_after_layer
+            assert self.ctc_split_after_layer < self.n_layers
+
         # embeddings
         self.position_embeddings = Embedding(N_MAX_POSITIONS, self.dim)
         if params.sinusoidal_embeddings:
@@ -301,18 +363,35 @@ class TransformerModel(nn.Module):
             self.layer_norm15 = nn.ModuleList()
             self.encoder_attn = nn.ModuleList()
 
-        for _ in range(self.n_layers):
+        # ctc-model-related layers
+        if self.ctc_model:
+            self.split_layer = StateSplit(params)
+
+            if self.ctc_use_inner_attention:
+                self.inner_attn = nn.ModuleList()
+                self.layer_norm17 = nn.ModuleList()
+
+        for i in range(self.n_layers):
             self.attentions.append(MultiHeadAttention(self.n_heads, self.dim, dropout=self.attention_dropout))
             self.layer_norm1.append(nn.LayerNorm(self.dim, eps=1e-12))
             if self.is_decoder:
                 self.layer_norm15.append(nn.LayerNorm(self.dim, eps=1e-12))
                 self.encoder_attn.append(MultiHeadAttention(self.n_heads, self.dim, dropout=self.attention_dropout))
+
+            if self.ctc_model and self.ctc_use_inner_attention and i > self.ctc_split_after_layer:
+                self.inner_attn.append(MultiHeadAttention(self.n_heads, self.dim, dropout=self.attention_dropout))
+                self.layer_norm17.append(nn.LayerNorm(self.dim, eps=1e-12))
+
             self.ffns.append(TransformerFFN(self.dim, self.hidden_dim, self.dim, dropout=self.dropout, gelu_activation=params.gelu_activation))
             self.layer_norm2.append(nn.LayerNorm(self.dim, eps=1e-12))
 
         # output layer
         if self.with_output:
-            self.pred_layer = PredLayer(params)
+            if self.ctc_model:
+                self.pred_layer = CTCPredLayer(params)
+            else:
+                self.pred_layer = PredLayer(params)
+
             if params.share_inout_emb:
                 self.pred_layer.proj.weight = self.embeddings.weight
 
@@ -352,8 +431,15 @@ class TransformerModel(nn.Module):
             assert self.is_decoder
             assert src_enc.size(0) == bs
 
+        assert not (self.ctc_model and cache is not None) # TODO zjistit jak to funguje a dyztak to upravit
+
         # generate masks
         mask, attn_mask = get_masks(slen, lengths, causal)
+
+        if self.ctc_model:
+            assert not causal  # TODO think about what would that mean
+            ctc_mask, ctc_attn_mask = get_masks(slen * self.ctc_split_factor, lengths * self.ctc_split_factor, causal)
+
         if self.is_decoder and src_enc is not None:
             src_mask = torch.arange(src_len.max(), dtype=torch.long, device=lengths.device) < src_len[:, None]
 
@@ -361,9 +447,14 @@ class TransformerModel(nn.Module):
         if positions is None:
             positions = x.new(slen).long()
             positions = torch.arange(slen, out=positions).unsqueeze(0)
+
+            positions_after_split = x.new(self.ctc_split_factor * slen).long()
+            positions_after_split = torch.arange(self.ctc_split_factor * slen, out=positions_after_split).unsqueeze(0)
         else:
             assert positions.size() == (slen, bs)
             positions = positions.transpose(0, 1)
+
+            assert not self.ctc_model
 
         # langs
         if langs is not None:
@@ -389,6 +480,8 @@ class TransformerModel(nn.Module):
         tensor = F.dropout(tensor, p=self.dropout, training=self.training)
         tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
+        inner_att_target = None
+
         # transformer layers
         for i in range(self.n_layers):
 
@@ -413,6 +506,25 @@ class TransformerModel(nn.Module):
             tensor = self.layer_norm2[i](tensor)
             tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
+            if self.ctc_model and self.ctc_split_after_layer == i:
+                tensor, _ = self.split_layer(tensor, lengths)
+
+                if self.ctc_add_pos_emb_after_split:
+                    tensor = tensor + self.position_embeddings(positions_after_split).expand_as(tensor)
+
+                if self.ctc_use_inner_attention:
+                    inner_att_target = tensor
+
+                attn_mask = ctc_attn_mask
+                mask = ctc_mask
+
+            # inner attention (for ctc model after a certain layer only)
+            if self.ctc_model and self.ctc_use_inner_attention and i > self.ctc_split_after_layer:
+                attn = self.inner_attn[i - self.ctc_split_after_layer - 1](tensor, ctc_attn_mask, kv=inner_att_target, cache=cache)
+                attn = F.dropout(attn, p=self.dropout, training=self.training)
+                tensor = tensor + attn
+                tensor = self.layer_norm17[i - self.ctc_split_after_layer - 1](tensor)
+
         # update cache length
         if cache is not None:
             cache['slen'] += tensor.size(1)
@@ -422,7 +534,7 @@ class TransformerModel(nn.Module):
 
         return tensor
 
-    def predict(self, tensor, pred_mask, y, get_scores):
+    def predict(self, tensor, pred_mask, y, get_scores, xlen=None, ylen=None):
         """
         Given the last hidden state, compute word scores and/or the loss.
             `pred_mask` is a ByteTensor of shape (slen, bs), filled with 1 when
@@ -430,8 +542,13 @@ class TransformerModel(nn.Module):
             `y` is a LongTensor of shape (pred_mask.sum(),)
             `get_scores` is a boolean specifying whether we need to return scores
         """
-        masked_tensor = tensor[pred_mask.unsqueeze(-1).expand_as(tensor)].view(-1, self.dim)
-        scores, loss = self.pred_layer(masked_tensor, y, get_scores)
+
+        if self.ctc_model:
+            assert xlen is not None and ylen is not None
+            scores, loss = self.pred_layer(tensor, y, xlen, ylen, get_scores)
+        else:
+            masked_tensor = tensor[pred_mask.unsqueeze(-1).expand_as(tensor)].view(-1, self.dim)
+            scores, loss = self.pred_layer(masked_tensor, y, get_scores)
         return scores, loss
 
     def predict_wo_targets(self, tensor, pred_mask):
@@ -442,9 +559,47 @@ class TransformerModel(nn.Module):
             `y` is a LongTensor of shape (pred_mask.sum(),)
             `get_scores` is a boolean specifying whether we need to return scores
         """
-        masked_tensor = tensor[pred_mask.unsqueeze(-1).expand_as(tensor)].view(-1, self.dim)
-        scores = self.pred_layer.get_scores(masked_tensor)
+
+        if self.ctc_model:
+            assert xlen is not None and ylen is not None
+
+
+            scores = self.pred_layer.get_scores(tensor, xlen)
+        else:
+            masked_tensor = tensor[pred_mask.unsqueeze(-1).expand_as(tensor)].view(-1, self.dim)
+            scores = self.pred_layer.get_scores(masked_tensor)
         return scores
+
+    def ctc_greedy_decode(self, word_scores, src_len, tgt_lang_id):
+
+        # word scores: Tensor(src_len, batch, vocabulary_size)
+
+        # select max words, filter out blanks
+
+        # input batch
+        bs = len(src_len)
+        assert word_scores.size(1) == bs
+
+        argmaxes = word_scores.max(2)[1]
+        max_len = argmaxes.shape[0] + 2
+
+        # generated sentences
+        generated = src_len.new(1, bs)  # upcoming output
+        generated.fill_(self.eos_index)    # we use <EOS> for <BOS> everywhere
+
+
+        generated = torch.cat([generated, argmaxes, generated], dim=0)
+
+
+
+        lengths_gen = argmaxes.new(argmaxes.shape[1]).fill_(max_len)
+
+        return generated, lengths_gen
+
+
+
+
+
 
     def generate(self, src_enc, src_len, tgt_lang_id, max_len=200, sample_temperature=None):
         """
