@@ -376,7 +376,17 @@ def check_data_params(params):
         if src < tgt and ((src, tgt) in required_para or (tgt, src) in required_para)
     }
 
-    assert all([all([os.path.isfile(p1) and os.path.isfile(p2) for p1, p2 in paths.values()]) for paths in params.para_dataset.values()])
+    nonexist = []
+    for paths in params.para_dataset.values():
+        for p1, p2 in paths.values():
+            if not os.path.isfile(p1):
+                nonexist.append(p1)
+            if not os.path.isfile(p2):
+                nonexist.append(p2)
+
+    if nonexist:
+        print(nonexist)
+    assert not nonexist
 
     # check that we can evaluate on BLEU
     assert params.eval_bleu is False or len(params.mt_steps + params.bt_steps + params.ctc_steps) > 0
