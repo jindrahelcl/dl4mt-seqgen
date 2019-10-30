@@ -5,12 +5,14 @@ max_epoch=${4:-100}
 
 lgsnohyp=${lgs/-/}
 
-#export NGPU=6; CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=$NGPU ../train.py  \
+exp_name=ctc_$lgsnohyp
 
-export NGPU=1; CUDA_VISIBLE_DEVICES=0 python ../train.py  \
-  --exp_name test_ctc \
-  --dump_path dumpCTC \
-  --data_path /home/t-jihelc/work/cuni/test_inp \
+#export NGPU=1; CUDA_VISIBLE_DEVICES=0 python ../train.py  \
+
+export NGPU=8; CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=$NGPU ../train.py  \
+  --exp_name $exp_name \
+  --dump_path experiments \
+  --data_path /home/helcl/twork/XLM_ctc/xlm_data/$lgsnohyp \
   --lgs "$lgs" \
   --encoder_only true \
   --emb_dim 512 \

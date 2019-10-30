@@ -927,14 +927,14 @@ class CTCTrainer(SingleTrainer):
         self.stats[("CTC-%s-%s" % (lang1, lang2))].append(loss.item())
         loss = lambda_coeff * loss
 
-        old_embeddings = self.model.embeddings.weight.cpu().detach().numpy()
+        # old_embeddings = self.model.embeddings.weight.cpu().detach().numpy()
 
         # optimize
         self.optimize(loss, "model")
 
         # check NaN
-        if (self.model.embeddings.weight != self.model.embeddings.weight).data.any():
-            import ipdb;ipdb.set_trace()
+        #if (self.model.embeddings.weight != self.model.embeddings.weight).data.any():
+        #    import ipdb;ipdb.set_trace()
 
         # number of processed sentences / words
         self.n_sentences += params.batch_size

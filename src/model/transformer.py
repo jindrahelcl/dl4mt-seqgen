@@ -139,7 +139,7 @@ class CTCPredLayer(nn.Module):
         scores = self.proj(x)  #.view(-1, self.n_words)
         log_probs = self.softmax(scores)
 
-        loss = F.ctc_loss(log_probs, y, xlen, ylen, zero_infinity=True, blank=BLANK_WORD)
+        loss = F.ctc_loss(log_probs, y, xlen, ylen, zero_infinity=True, blank=6)
 
         # return tuple scores, loss; scores je vystup z projekce, loss je skalar
         return log_probs, loss
